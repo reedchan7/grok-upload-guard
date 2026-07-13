@@ -1,22 +1,31 @@
 # grok-upload-guard
 
-**Detect** whether [Grok Build CLI](https://x.ai/) has been uploading your local codebase, and **fix** (disable) whole-repo / session-trace uploads via `~/.grok/config.toml`.
+A small **self-defense** helper for [Grok Build CLI](https://x.ai/) users:
 
-Local-only. No network calls. No dependencies beyond Python 3.10+.
+1. **Detect (local only)** — scan your machine’s `~/.grok` logs / session signals for *evidence that uploads already happened on this computer*.
+2. **Fix** — patch `~/.grok/config.toml` to turn off whole-repo / session-trace upload knobs.
 
-## Why this exists
+**This project did not discover the upload behavior.**  
+The behavior was established by **independent wire capture** (mitmproxy, recovered git bundles, multi-GB `/v1/storage` traffic) and has been **reproduced / discussed widely** (Reddit, HN, X). `@grok` has also publicly described the mechanics as intentional product design.
 
-Independent wire analysis (July 2026) and local logs show Grok Build CLI can:
+What we add is practical: **check your own box, harden your config, reduce further leakage.**  
+Local log detection ≠ packet capture. A clean local scan does not “disprove” the wire findings; a hit on local logs does not claim we re-ran mitmproxy for you.
+
+No network calls. No dependencies beyond Python 3.10+.
+
+## Why people care
+
+Independent researchers showed Grok Build CLI can:
 
 1. Upload a **snapshot of your git-tracked repo** (including history) as a bundle / archive — even for files the agent never opens.
 2. Send **file contents the agent reads** (including `.env` if read) to the model API — normal for cloud coding agents, but unredacted.
-3. Keep uploads on even when **“Improve the model” is off** (that toggle is about training policy, not transport).
+3. Keep those uploads on even when **“Improve the model” is off** (training policy ≠ transport).
 
-Uploads are product infrastructure (`repo_state` / session traces), not something the agent “decides” per reply.
+Uploads are product infrastructure (`repo_state` / session traces), not something the model “decides” per reply.
 
-**Impact:** private repos, API keys, DB passwords, and full git history may leave your machine. Treat any secrets that lived in a workspace you ran Grok Build on as **potentially exposed** and rotate them.
+**Impact:** private repos, API keys, DB passwords, and full git history may leave your machine. Treat secrets that lived in a workspace you ran Grok Build on as **potentially exposed** and rotate them.
 
-This tool addresses the **whole-repo / trace upload** channel. It does **not** stop the model API from receiving files the agent intentionally reads (that is how cloud agents work).
+This tool only helps with the **whole-repo / trace upload** channel (config + local evidence). It does **not** stop the model API from receiving files the agent intentionally reads.
 
 ## Quick start (no clone)
 
@@ -120,7 +129,8 @@ Override home with `--home /path/to/.grok` or `GROK_HOME`.
 
 ## Limits (read this)
 
-- **Local evidence only** — proves enqueue/upload counters on your machine, not remote bucket contents.
+- **Not a wire proof.** `detect` only reads local artifacts under `~/.grok`. The authoritative proof of on-the-wire behavior is the community wire analysis (see Sources). We are a **protection utility**, not a replacement for that research.
+- **Local evidence only** — enqueue/upload counters and decisions on *your* machine, not a re-download of remote GCS objects.
 - **Does not block model-channel reads** — if the agent opens `.env`, that content still goes to the cloud model API.
 - **Remote settings** may still influence upload decisions; re-check after every CLI update.
 - **Not affiliated with xAI.** Behavior is version-specific; verify on your install.

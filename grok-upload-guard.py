@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """
-grok-upload-guard — detect + disable Grok Build CLI whole-repo uploads.
+grok-upload-guard — local self-defense helper for Grok Build CLI users.
+
+This tool does NOT claim to re-prove the upload behavior with packet capture.
+That was established by independent wire analysis (community research).
+Here we only:
+  - detect: scan local ~/.grok logs/signals for upload evidence on THIS machine
+  - fix:    patch ~/.grok/config.toml to disable whole-repo / session-trace uploads
 
 Local-only. Does not contact the network.
 
@@ -11,7 +17,7 @@ Local-only. Does not contact the network.
   python3 grok-upload-guard.py fix --dry-run
   python3 grok-upload-guard.py all          # detect, then fix
 
-See README.md for context and limits.
+See README.md for context, sources, and limits.
 """
 
 from __future__ import annotations
@@ -355,9 +361,15 @@ def _short(path: str, n: int = 52) -> str:
 def render_brief(d: dict[str, Any]) -> str:
     lines = []
     if d["evidence_of_upload"]:
-        lines.append("Verdict: UPLOADED (local evidence of codebase/session uploads)")
+        lines.append(
+            "Verdict: UPLOADED (local log evidence on THIS machine — "
+            "not a wire/mitm re-proof)"
+        )
     else:
-        lines.append("Verdict: no local codebase-upload evidence found")
+        lines.append(
+            "Verdict: no local codebase-upload evidence found "
+            "(does not disprove community wire findings)"
+        )
     lines.append(
         f"Grok {d.get('grok_version') or '?'}  |  "
         f"starts={d['repo_state_upload_start']}  "
@@ -414,9 +426,12 @@ def render_full(d: dict[str, Any]) -> str:
         "## Verdict",
         "",
         (
-            "**Local evidence shows codebase/session uploads occurred.**"
+            "**Local `~/.grok` logs show codebase/session uploads on this machine.** "
+            "(Local detection only — the original proof is community wire capture; "
+            "see README Sources.)"
             if d["evidence_of_upload"]
-            else "**No local evidence of codebase uploads found.**"
+            else "**No local codebase-upload evidence found on this machine.** "
+            "(Does not disprove independent wire analysis.)"
         ),
         "",
         f"- `repo_state.upload.start`: **{d['repo_state_upload_start']}**",
@@ -457,6 +472,7 @@ def render_full(d: dict[str, Any]) -> str:
         "",
         "## Limits",
         "",
+        "- Not a packet-capture proof; community wire analysis is the discovery source.",
         "- Local logs only — does not re-download remote objects.",
         "- Files the agent *reads* still go to the model API (normal for cloud agents).",
         "- This tool only targets whole-repo / session-trace upload (Channel B).",
@@ -554,7 +570,11 @@ def cmd_all(args: argparse.Namespace) -> int:
 def main() -> int:
     ap = argparse.ArgumentParser(
         prog="grok-upload-guard",
-        description="Detect and disable Grok Build CLI whole-repo uploads (local-only).",
+        description=(
+            "Local self-defense helper: scan ~/.grok for upload evidence and "
+            "disable whole-repo/session-trace uploads. Not a wire-capture proof "
+            "(that research is from the community; see README)."
+        ),
     )
     ap.add_argument(
         "--home",
