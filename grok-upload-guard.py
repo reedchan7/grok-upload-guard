@@ -193,6 +193,62 @@ def load_jsonl(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def load_auth_privacy(home: Path) -> dict[str, Any]:
+    """Read only privacy/opt-out fields from auth.json (never log tokens)."""
+    path = home / "auth.json"
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    keys = [
+        "coding_data_retention_opt_out",
+        "data_retention_opt_out",
+        "product_data_retention_opt_out",
+    ]
+    out: dict[str, Any] = {}
+    for k in keys:
+        if k in data:
+            out[k] = data[k]
+    # Grok auth.json nests account data under keys like "https://auth.x.ai::<uuid>".
+    for v in data.values():
+        if isinstance(v, dict):
+            for k in keys:
+                if k in v:
+                    out[k] = v[k]
+    return out
+
+
+def parse_ts(ts: Any) -> datetime | None:
+    """Best-effort parse a timestamp from Grok logs (ISO str or ms/s epoch)."""
+    if ts is None:
+        return None
+    if isinstance(ts, (int, float)):
+        # Grok logs often use millisecond epochs.
+        if ts > 1e12:
+            ts = ts / 1000.0
+        return datetime.fromtimestamp(ts, tz=timezone.utc)
+    if isinstance(ts, str):
+        ts = ts.strip()
+        if not ts:
+            return None
+        try:
+            return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        except ValueError:
+            pass
+        try:
+            f = float(ts)
+            if f > 1e12:
+                f = f / 1000.0
+            return datetime.fromtimestamp(f, tz=timezone.utc)
+        except ValueError:
+            return None
+    return None
+
+
 def detect(home: Path) -> dict[str, Any]:
     log_path = home / "logs" / "unified.jsonl"
     rows = load_jsonl(log_path)
@@ -210,7 +266,20 @@ def detect(home: Path) -> dict[str, Any]:
     # session -> turn -> repo from starts
     turn_repo: dict[tuple[str, Any], str] = {}
 
+    today = datetime.now(timezone.utc).astimezone().date()
+    today_starts = 0
+    today_enqueued = 0
+    today_enq_bytes = 0
+    today_decisions_true = 0
+    today_decisions_false = 0
+    today_reasons: Counter[str] = Counter()
+    today_by_repo: dict[str, dict[str, Any]] = defaultdict(
+        lambda: {"starts": 0, "enqueued": 0, "bytes": 0, "sessions": set()}
+    )
+
     for row in rows:
+        row_ts = parse_ts(row.get("ts"))
+        is_today = row_ts is not None and row_ts.astimezone().date() == today
         msg = row.get("msg") or ""
         ctx = row.get("ctx") if isinstance(row.get("ctx"), dict) else {}
         sid = str(row.get("sid") or "")
@@ -220,6 +289,10 @@ def detect(home: Path) -> dict[str, Any]:
             by_repo[repo]["starts"] += 1
             by_repo[repo]["sessions"].add(sid)
             turn_repo[(sid, ctx.get("turn_number"))] = repo
+            if is_today:
+                today_starts += 1
+                today_by_repo[repo]["starts"] += 1
+                today_by_repo[repo]["sessions"].add(sid)
         elif msg == "repo_state.upload.enqueued":
             enqueued += 1
             size = int(ctx.get("size_bytes") or 0)
@@ -230,15 +303,27 @@ def detect(home: Path) -> dict[str, Any]:
             by_repo[repo]["enqueued"] += 1
             by_repo[repo]["bytes"] += size
             by_repo[repo]["sessions"].add(sid)
+            if is_today:
+                today_enqueued += 1
+                today_enq_bytes += size
+                today_by_repo[repo]["enqueued"] += 1
+                today_by_repo[repo]["bytes"] += size
+                today_by_repo[repo]["sessions"].add(sid)
         elif msg == "trace.upload.decision":
             enabled = ctx.get("uploads_enabled")
             if enabled is True:
                 decisions_true += 1
+                if is_today:
+                    today_decisions_true += 1
             elif enabled is False:
                 decisions_false += 1
+                if is_today:
+                    today_decisions_false += 1
             reason = ctx.get("upload_reason")
             if reason:
                 reasons[str(reason)] += 1
+                if is_today:
+                    today_reasons[str(reason)] += 1
             latest_decision = {
                 "ts": row.get("ts"),
                 "uploads_enabled": enabled,
@@ -280,6 +365,8 @@ def detect(home: Path) -> dict[str, Any]:
         except OSError:
             cfg = {}
 
+    auth_privacy = load_auth_privacy(home)
+
     privacy = {
         "features.telemetry": get_nested(cfg, "features", "telemetry"),
         "telemetry.trace_upload": get_nested(cfg, "telemetry", "trace_upload"),
@@ -318,6 +405,18 @@ def detect(home: Path) -> dict[str, Any]:
             }
         )
 
+    today_repos_out = []
+    for repo, d in sorted(today_by_repo.items(), key=lambda kv: -kv[1]["starts"]):
+        today_repos_out.append(
+            {
+                "path": repo,
+                "starts": d["starts"],
+                "enqueued": d["enqueued"],
+                "mb": round(d["bytes"] / (1024 * 1024), 3),
+                "sessions": len(d["sessions"]),
+            }
+        )
+
     evidence = bool(starts or enqueued or gcs_uploaded)
 
     return {
@@ -336,6 +435,17 @@ def detect(home: Path) -> dict[str, Any]:
         "gcs_queue_enqueued": gcs_enqueued,
         "sessions_with_gcs": sessions_hit,
         "repos": repos_out,
+        "auth_privacy": auth_privacy,
+        "today": {
+            "date": today.isoformat(),
+            "repo_state_upload_start": today_starts,
+            "repo_state_upload_enqueued": today_enqueued,
+            "enqueued_mb": round(today_enq_bytes / (1024 * 1024), 3),
+            "decisions_enabled": today_decisions_true,
+            "decisions_disabled": today_decisions_false,
+            "upload_reasons": dict(today_reasons),
+            "repos": today_repos_out,
+        },
         "config": privacy,
         "config_path": str(cfg_file),
         "upload_queue_pending_files": queue_files,
@@ -344,12 +454,12 @@ def detect(home: Path) -> dict[str, Any]:
     }
 
 
-def _flag(val: Any, want: Any) -> str:
-    if val is want:
-        return "ok"
-    if val is None:
-        return "unset"
-    return f"WARN({val!r})"
+def _opt_out_flag(val: Any) -> str:
+    if val is True:
+        return "opted_out"
+    if val is False:
+        return "not_opted_out"
+    return "unset"
 
 
 def _short(path: str, n: int = 52) -> str:
@@ -359,48 +469,123 @@ def _short(path: str, n: int = 52) -> str:
 
 
 def render_brief(d: dict[str, Any]) -> str:
-    lines = []
+    lines: list[str] = []
+
+    # Header
+    generated = d.get("generated_at") or datetime.now(timezone.utc).isoformat()
+    if generated:
+        generated = generated[:19].replace("T", " ")
+    lines.append(f"Grok upload guard — {generated} UTC")
+    lines.append(
+        f"Version: {d.get('grok_version') or '?'}  |  Home: {_short(d['grok_home'])}"
+    )
+    lines.append("")
+
+    # Verdict
     if d["evidence_of_upload"]:
-        lines.append(
-            "Verdict: UPLOADED (local log evidence on THIS machine — "
-            "not a wire/mitm re-proof)"
-        )
+        lines.append("[Verdict]")
+        lines.append("Local logs show codebase/session uploads on this machine.")
     else:
-        lines.append(
-            "Verdict: no local codebase-upload evidence found "
-            "(does not disprove community wire findings)"
-        )
+        lines.append("[Verdict]")
+        lines.append("No local codebase-upload evidence found.")
+    lines.append("")
+
+    # Today
+    t = d.get("today") or {}
+    lines.append(f"[Today: {t.get('date')}]")
+    lines.append(f"  {'Upload starts:':<18} {t.get('repo_state_upload_start', 0)}")
     lines.append(
-        f"Grok {d.get('grok_version') or '?'}  |  "
-        f"starts={d['repo_state_upload_start']}  "
-        f"enqueued={d['repo_state_upload_enqueued']}  "
-        f"gcs_uploaded={d['gcs_queue_uploaded']}  "
-        f"repos={len(d['repos'])}"
+        f"  {'Upload enqueued:':<18} {t.get('repo_state_upload_enqueued', 0)} "
+        f"({t.get('enqueued_mb', 0)} MB)"
     )
     lines.append(
-        f"Decisions: enabled={d['decisions_enabled']}  "
-        f"disabled={d['decisions_disabled']}  "
-        f"reasons={d.get('upload_reasons') or {}}"
+        f"  {'Decisions:':<18} +{t.get('decisions_enabled', 0)} enabled / "
+        f"+{t.get('decisions_disabled', 0)} disabled"
     )
+    reasons_today = t.get("upload_reasons") or {}
+    if reasons_today:
+        lines.append(f"  {'Reasons:':<18} {reasons_today}")
+    today_repos = t.get("repos") or []
+    if today_repos:
+        lines.append(f"  {'Repos affected:':<18} {len(today_repos)}")
+        for r in today_repos[:5]:
+            lines.append(
+                f"    - {_short(r['path']):<48}  "
+                f"starts={r['starts']:<3}  enq={r['enqueued']:<3}  "
+                f"{r['mb']:>6.2f} MB"
+            )
+        if len(today_repos) > 5:
+            lines.append(f"    ... +{len(today_repos) - 5} more")
+    else:
+        lines.append(f"  {'Repos affected:':<18} none")
+    lines.append("")
+
+    # All time
+    lines.append("[All time]")
+    lines.append(f"  {'Upload starts:':<18} {d['repo_state_upload_start']}")
+    lines.append(
+        f"  {'Upload enqueued:':<18} {d['repo_state_upload_enqueued']} ({d['enqueued_mb']} MB)"
+    )
+    lines.append(f"  {'GCS uploaded:':<18} {d['gcs_queue_uploaded']}")
+    lines.append(
+        f"  {'Decisions:':<18} {d['decisions_enabled']} enabled / "
+        f"{d['decisions_disabled']} disabled"
+    )
+    reasons = d.get("upload_reasons") or {}
+    if reasons:
+        lines.append(f"  {'Reasons:':<18} {reasons}")
     ld = d.get("latest_decision") or {}
     if ld:
+        status = "enabled" if ld.get("uploads_enabled") else "disabled"
         lines.append(
-            f"Latest decision: enabled={ld.get('uploads_enabled')}  "
-            f"reason={ld.get('upload_reason')}  ts={ld.get('ts')}"
+            f"  {'Latest decision:':<18} {status} ({ld.get('upload_reason')}) at {ld.get('ts')}"
         )
+    lines.append("")
+
+    # Privacy opt-out
+    lines.append("[Privacy opt-out]")
+    ap = d.get("auth_privacy") or {}
+    if ap:
+        for k, v in ap.items():
+            lines.append(f"  {k}: {_opt_out_flag(v)}")
+    else:
+        lines.append("  (not found in auth.json)")
+    lines.append("")
+
+    # Config
+    lines.append("[Config]")
     c = d["config"]
+
+    def _cfg(val: Any) -> str:
+        if val is None:
+            return "unset"
+        if isinstance(val, bool):
+            return "true" if val else "false"
+        return str(val)
+
     lines.append(
-        "Config: "
-        f"telemetry={_flag(c.get('features.telemetry'), False)}  "
-        f"trace_upload={_flag(c.get('telemetry.trace_upload'), False)}  "
-        f"disable_codebase_upload={_flag(c.get('harness.disable_codebase_upload'), True)}"
+        f"  {'telemetry:':<26} {_cfg(c.get('features.telemetry'))}"
     )
     lines.append(
-        f"Upload queue pending: {d['upload_queue_pending_files']} files / "
+        f"  {'trace_upload:':<26} {_cfg(c.get('telemetry.trace_upload'))}"
+    )
+    lines.append(
+        f"  {'disable_codebase_upload:':<26} "
+        f"{_cfg(c.get('harness.disable_codebase_upload'))}"
+    )
+    lines.append("")
+
+    # Upload queue
+    lines.append("[Upload queue]")
+    lines.append(
+        f"  Pending: {d['upload_queue_pending_files']} files / "
         f"{d['upload_queue_pending_bytes']} B"
     )
+    lines.append("")
+
+    # Repos
     if d["repos"]:
-        lines.append("Repos:")
+        lines.append("[Repos]")
         for r in d["repos"][:8]:
             lines.append(
                 f"  {_short(r['path']):<52}  "
@@ -408,9 +593,13 @@ def render_brief(d: dict[str, Any]) -> str:
                 f"{r['mb']:>6.2f} MB  sess={r['sessions']}"
             )
         if len(d["repos"]) > 8:
-            lines.append(f"  … +{len(d['repos']) - 8} more")
-    lines.append("Tip:  python3 grok-upload-guard.py fix")
-    lines.append("      python3 grok-upload-guard.py detect --full")
+            lines.append(f"  ... +{len(d['repos']) - 8} more")
+        lines.append("")
+
+    lines.append(
+        "Tip: run `python3 grok-upload-guard.py fix` to patch config, "
+        "or `--full` for details."
+    )
     return "\n".join(lines) + "\n"
 
 
@@ -442,6 +631,47 @@ def render_full(d: dict[str, Any]) -> str:
         f"- session gcsQueueUploaded total: **{d['gcs_queue_uploaded']}** "
         f"(sessions with activity: {d['sessions_with_gcs']})",
         f"- upload reasons: `{d.get('upload_reasons')}`",
+        "",
+        "## Today",
+        "",
+    ]
+    t = d.get("today") or {}
+    lines += [
+        f"- Date: **{t.get('date')}**",
+        f"- `repo_state.upload.start`: **{t.get('repo_state_upload_start', 0)}**",
+        f"- `repo_state.upload.enqueued`: **{t.get('repo_state_upload_enqueued', 0)}** "
+        f"({t.get('enqueued_mb', 0)} MB logged)",
+        f"- decisions uploads_enabled=true: **{t.get('decisions_enabled', 0)}**",
+        f"- decisions uploads_enabled=false: **{t.get('decisions_disabled', 0)}**",
+        f"- upload reasons today: `{t.get('upload_reasons')}`",
+        "",
+        "### Repos today",
+        "",
+    ]
+    if not t.get("repos"):
+        lines.append("_None._")
+    else:
+        lines.append("| Repo | Starts | Enqueued | MB | Sessions |")
+        lines.append("|------|-------:|---------:|---:|---------:|")
+        for r in t["repos"]:
+            lines.append(
+                f"| `{r['path']}` | {r['starts']} | {r['enqueued']} | "
+                f"{r['mb']} | {r['sessions']} |"
+            )
+    lines += [
+        "",
+        "## Privacy opt-out",
+        "",
+        "Status read from `~/.grok/auth.json` (tokens are never logged).",
+        "",
+    ]
+    ap = d.get("auth_privacy") or {}
+    if ap:
+        for k, v in ap.items():
+            lines.append(f"- `{k}`: **`{_opt_out_flag(v)}`**")
+    else:
+        lines.append("_No opt-out fields found in auth.json._")
+    lines += [
         "",
         "## Config",
         "",

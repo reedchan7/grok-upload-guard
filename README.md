@@ -58,13 +58,42 @@ python3 grok-upload-guard.py detect
 Example brief output:
 
 ```
-Verdict: UPLOADED (local evidence of codebase/session uploads)
-Grok 0.2.99  |  starts=89  enqueued=82  gcs_uploaded=188  repos=4
-Decisions: enabled=49  disabled=4  reasons={'proxy': 49, 'feature_off': 4}
-Latest decision: enabled=False  reason=feature_off  ts=...
-Config: telemetry=ok  trace_upload=ok  disable_codebase_upload=ok
-Repos:
+Grok upload guard — 2026-07-14 10:21:45 UTC
+Version: 0.2.99  |  Home: ~/.grok
+
+[Verdict]
+Local logs show codebase/session uploads on this machine.
+
+[Today: 2026-07-14]
+  Upload starts:     0
+  Upload enqueued:   0 (0.0 MB)
+  Decisions:         +0 enabled / +8 disabled
+  Reasons:           {'zdr_team': 8}
+  Repos affected:    none
+
+[All time]
+  Upload starts:     89
+  Upload enqueued:   82 (4.215 MB)
+  GCS uploaded:      188
+  Decisions:         49 enabled / 4 disabled
+  Reasons:           {'proxy': 49, 'feature_off': 4}
+  Latest decision:   disabled (feature_off) at ...
+
+[Privacy opt-out]
+  coding_data_retention_opt_out: opted_out
+
+[Config]
+  telemetry:                 false
+  trace_upload:              false
+  disable_codebase_upload:   true
+
+[Upload queue]
+  Pending: 0 files / 0 B
+
+[Repos]
   ~/Workspaces/w/my-app   starts=53  enq=53  3.00 MB  sess=9
+
+Tip: run `python3 grok-upload-guard.py fix` to patch config, or `--full` for details.
 ```
 
 Full report / JSON:
@@ -120,9 +149,10 @@ export GROK_WORKSPACE_DATA_COLLECTION_DISABLED=1
 
 | Source | Signal |
 |--------|--------|
-| `~/.grok/logs/unified.jsonl` | `repo_state.upload.*`, `trace.upload.decision` |
+| `~/.grok/logs/unified.jsonl` | `repo_state.upload.*`, `trace.upload.decision` (with today vs. all-time split) |
 | `~/.grok/sessions/**/signals.json` | `gcsQueueUploaded` / `gcsQueueEnqueued` |
 | `~/.grok/config.toml` | privacy-related keys |
+| `~/.grok/auth.json` | `/privacy opt-out` status (`coding_data_retention_opt_out`; tokens are never logged) |
 | `~/.grok/upload_queue/` | pending staged blobs |
 
 Override home with `--home /path/to/.grok` or `GROK_HOME`.
